@@ -1,4 +1,10 @@
-use nom::character::complete::{alphanumeric1, digit1, hex_digit1, space0};
+use nom::{
+    bytes::complete::tag,
+    character::complete::{alphanumeric1, digit1, hex_digit1, space0},
+    combinator::map_res,
+    sequence::tuple,
+    IResult,
+};
 
 #[cfg(test)]
 mod tests {
@@ -31,16 +37,17 @@ pub struct Timestamp {
     pub nanos: u64,
 }
 
-named!(timestamp<&str, Timestamp>,
-    do_parse!(
-                 tag!("(")                             >>
-        seconds: map_res!(digit1, |d: &str| d.parse()) >>
-                 tag!(".")                             >>
-        nanos:   map_res!(digit1, |d: &str| d.parse()) >>
-                 tag!(")")                             >>
-        (Timestamp { seconds, nanos })
-    )
-);
+fn timestamp(input: &str) -> IResult<&str, Timestamp> {
+    let (input, (_, seconds, _, nanos, _)) = tuple((
+        tag("("),
+        map_res(digit1, |d: &str| d.parse()),
+        tag("."),
+        map_res(digit1, |d: &str| d.parse()),
+        tag(")"),
+    ))(input)?;
+    
+    Ok((input, Timestamp { seconds, nanos }))
+}
 
 #[derive(Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -49,14 +56,15 @@ pub struct CanFrame {
     pub frame_body: u64,
 }
 
-named!(can_frame<&str, CanFrame>,
-    do_parse!(
-        frame_id:   map_res!(hex_digit1, |d| u32::from_str_radix(d, 16))  >>
-                    tag!("#")                                             >>
-        frame_body: map_res!(hex_digit1, |d| u64::from_str_radix(d, 16))  >>
-        (CanFrame { frame_id, frame_body })
-    )
-);
+fn can_frame(input: &str) -> IResult<&str, CanFrame> {
+    let (input, (frame_id, _, frame_body)) = tuple((
+        map_res(hex_digit1, |d| u32::from_str_radix(d, 16)),
+        tag("#"),
+        map_res(hex_digit1, |d| u64::from_str_radix(d, 16)),
+    ))(input)?;
+    
+    Ok((input, CanFrame { frame_id, frame_body }))
+}
 
 #[derive(Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -80,13 +88,18 @@ impl DumpEntry {
     }
 }
 
-named!(pub dump_entry<&str, DumpEntry>,
-    do_parse!(
-        timestamp:     timestamp     >>
-                       space0        >>
-        can_interface: alphanumeric1 >>
-                       space0        >>
-        can_frame:     can_frame     >>
-        (DumpEntry { timestamp, can_interface: can_interface.to_string(), can_frame })
-    )
-);
+pub fn dump_entry(input: &str) -> IResult<&str, DumpEntry> {
+    let (input, (timestamp, _, can_interface, _, can_frame)) = tuple((
+        timestamp,
+        space0,
+        alphanumeric1,
+        space0,
+        can_frame,
+    ))(input)?;
+    
+    Ok((input, DumpEntry { 
+        timestamp, 
+        can_interface: can_interface.to_string(), 
+        can_frame 
+    }))
+}

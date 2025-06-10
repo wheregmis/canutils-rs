@@ -5,7 +5,7 @@ use ansi_term::{
 use can_dbc::{self, Message};
 use pretty_hex::*;
 use rand::Rng;
-use socketcan;
+use socketcan::{tokio::CanSocket, CanFrame, EmbeddedFrame};
 use std::{
     fs::File,
     io::{self, prelude::*},
@@ -14,7 +14,10 @@ use std::{
 };
 use structopt::StructOpt;
 use tokio::time;
-use tokio_socketcan::CANFrame;
+
+// Standard CAN constants
+const EFF_MASK: u32 = 0x1FFFFFFF; // Extended Frame Format mask
+const SFF_MASK: u32 = 0x000007FF; // Standard Frame Format mask
 
 #[derive(Debug, StructOpt)]
 #[structopt(
@@ -62,7 +65,7 @@ async fn main() -> io::Result<()> {
     let mut buffer = Vec::new();
     f.read_to_end(&mut buffer)?;
 
-    let socket_tx = tokio_socketcan::CANSocket::open(&opt.can_interface).unwrap();
+    let socket_tx = CanSocket::open(&opt.can_interface).unwrap();
     let dbc = can_dbc::DBC::from_slice(&buffer).expect("Failed to parse DBC");
 
     // Filter messages by transmitter
@@ -101,7 +104,7 @@ async fn main() -> io::Result<()> {
             dbc_signal_range_gen.gen()
         };
 
-        socket_tx.write_frame(can_frame).unwrap().await.unwrap();
+        socket_tx.write_frame(can_frame).await.unwrap();
 
         messages_sent_counter += 1;
 
@@ -117,7 +120,7 @@ async fn main() -> io::Result<()> {
 }
 
 trait CanFrameGenStrategy: Send {
-    fn gen(&self) -> CANFrame;
+    fn gen(&self) -> CanFrame;
 }
 
 /// Generates signal values based on a given DBC messages.
@@ -130,9 +133,9 @@ struct DBCSignalRangeGen {
 }
 
 impl CanFrameGenStrategy for DBCSignalRangeGen {
-    fn gen(&self) -> CANFrame {
-        let mut rng = rand::thread_rng();
-        let message_idx: usize = rng.gen_range(0, self.dbc_messages.len() - 1);
+    fn gen(&self) -> CanFrame {
+        let mut rng = rand::rng();
+        let message_idx: usize = rng.gen_range(0..self.dbc_messages.len());
         let message = self.dbc_messages.get(message_idx).unwrap();
 
         println!("\n{}", Purple.paint(message.message_name()));
@@ -149,7 +152,7 @@ impl CanFrameGenStrategy for DBCSignalRangeGen {
         };
 
         let rand_frame_data = if *message.message_size() > 8 {
-            println!("Non random message body due to currently unsupported size `{}` - id: `{:x}`. Size {} > 8", message.message_name(), message.message_id().0, message.message_size());
+            println!("Non random message body due to currently unsupported size `{}` - id: `{:?}`. Size {} > 8", message.message_name(), message.message_id(), message.message_size());
             [0; 8]
         } else {
             self.gen_msg_frame_data(&message)
@@ -162,9 +165,19 @@ impl CanFrameGenStrategy for DBCSignalRangeGen {
             rand_frame_data.to_vec().hex_dump()
         );
 
-        let message_id = message.message_id().0 & socketcan::EFF_MASK;
+        let message_id: u32 = match message.message_id() {
+            can_dbc::MessageId::Standard(id) => (*id).into(),
+            can_dbc::MessageId::Extended(id) => *id,
+        };
 
-        CANFrame::new(message_id, &rand_frame_data, rtr_rand, err_rand)
+        // Create a proper CAN ID
+        let can_id = if message_id > 0x7FF {
+            socketcan::Id::Extended(socketcan::ExtendedId::new(message_id & EFF_MASK).unwrap())
+        } else {
+            socketcan::Id::Standard(socketcan::StandardId::new(message_id as u16 & 0x7FF).unwrap())
+        };
+
+        CanFrame::new(can_id, &rand_frame_data)
             .expect("Failed to create frame")
     }
 }
@@ -173,7 +186,7 @@ impl DBCSignalRangeGen {
     fn gen_msg_frame_data(&self, message: &can_dbc::Message) -> [u8; 8] {
         let mut frame_data_rand: u64 = 0;
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         for signal in message.signals() {
             let actual_value: f64 = if signal.min() == signal.max() {
@@ -185,7 +198,7 @@ impl DBCSignalRangeGen {
                 );
                 *signal.min()
             } else {
-                rng.gen_range(signal.min(), signal.max())
+                rng.gen_range(*signal.min()..*signal.max())
             };
 
             let random_signal_value = (actual_value - signal.offset) / signal.factor;
@@ -226,9 +239,9 @@ struct RandomFrameDataGen {
 }
 
 impl CanFrameGenStrategy for RandomFrameDataGen {
-    fn gen(&self) -> CANFrame {
-        let mut rng = rand::thread_rng();
-        let message_idx: usize = rng.gen_range(0, self.dbc_messages.len() - 1);
+    fn gen(&self) -> CanFrame {
+        let mut rng = rand::rng();
+        let message_idx: usize = rng.gen_range(0..self.dbc_messages.len());
         let message = self.dbc_messages.get(message_idx).unwrap();
 
         println!("\n{}", Purple.paint(message.message_name()));
@@ -254,8 +267,19 @@ impl CanFrameGenStrategy for RandomFrameDataGen {
             rand_frame_data.to_vec().hex_dump()
         );
 
-        let message_id = message.message_id().0 & socketcan::EFF_MASK;
-        CANFrame::new(message_id, &rand_frame_data, rtr_rand, err_rand)
+        let message_id: u32 = match message.message_id() {
+            can_dbc::MessageId::Standard(id) => (*id).into(),
+            can_dbc::MessageId::Extended(id) => *id,
+        };
+        
+        // Create a proper CAN ID
+        let can_id = if message_id > 0x7FF {
+            socketcan::Id::Extended(socketcan::ExtendedId::new(message_id & EFF_MASK).unwrap())
+        } else {
+            socketcan::Id::Standard(socketcan::StandardId::new(message_id as u16 & 0x7FF).unwrap())
+        };
+
+        CanFrame::new(can_id, &rand_frame_data)
             .expect("Failed to create frame")
     }
 }

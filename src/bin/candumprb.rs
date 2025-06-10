@@ -2,7 +2,7 @@ use ansi_term::Color::{self, Cyan, Fixed, Green, Purple};
 use anyhow::Result;
 use can_dbc::{ByteOrder, Signal};
 use futures::StreamExt;
-use socketcan::CANFrame;
+use socketcan::{tokio::CanSocket, CanFrame, EmbeddedFrame};
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fmt::Write;
@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use structopt::StructOpt;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
-use tokio_socketcan;
+
+// Standard CAN constants (missing from socketcan crate)
+const EFF_FLAG: u32 = 0x80000000; // Extended Frame Format flag
 
 const COLOR_CAN_ID: Color = Color::White;
 const COLOR_CAN_SFF: Color = Color::Blue;
@@ -97,9 +99,9 @@ struct Opt {
 async fn main() -> Result<()> {
     let opt = Opt::from_args();
 
-    let mut socket_rx = tokio_socketcan::CANSocket::open(&opt.can_interface).unwrap();
+    let mut socket_rx = CanSocket::open(&opt.can_interface).unwrap();
 
-    let byte_hex_table: Vec<String> = (0u8..=u8::max_value())
+    let byte_hex_table: Vec<String> = (0u8..=u8::MAX)
         .map(|i| {
             let byte_hex = format!("{:02x} ", i);
             Byte(i).color().paint(byte_hex).to_string()
@@ -116,8 +118,12 @@ async fn main() -> Result<()> {
         let mut signal_lookup = HashMap::new();
 
         for msg in dbc.messages() {
+            let message_id: u32 = match msg.message_id() {
+                can_dbc::MessageId::Standard(id) => (*id).into(),
+                can_dbc::MessageId::Extended(id) => *id,
+            };
             signal_lookup.insert(
-                msg.message_id().0 & !socketcan::EFF_FLAG,
+                message_id & !EFF_FLAG,
                 (msg.message_name().clone(), msg.signals().clone()),
             );
         }
@@ -141,10 +147,15 @@ async fn main() -> Result<()> {
                     write!(buffer, "{}", COLOR_CAN_SFF.paint("SFF ")).unwrap();
                 }
 
+                let raw_id = match frame.id() {
+                    socketcan::Id::Standard(id) => id.as_raw() as u32,
+                    socketcan::Id::Extended(id) => id.as_raw(),
+                };
+                
                 write!(
                     buffer,
                     "{}",
-                    COLOR_CAN_ID.paint(format!("{:08x} ", frame.id()))
+                    COLOR_CAN_ID.paint(format!("{:08x} ", raw_id))
                 )?;
 
                 for b in frame.data() {
@@ -163,8 +174,12 @@ async fn main() -> Result<()> {
 }
 
 // Given a CAN Frame, lookup the can signals and print the signal values
-fn print_dbc_signals(signal_lookup: &HashMap<u32, (String, Vec<Signal>)>, frame: &CANFrame) {
-    let id = frame.id() & !socketcan::EFF_FLAG;
+fn print_dbc_signals(signal_lookup: &HashMap<u32, (String, Vec<Signal>)>, frame: &CanFrame) {
+    let raw_id = match frame.id() {
+        socketcan::Id::Standard(id) => id.as_raw() as u32,
+        socketcan::Id::Extended(id) => id.as_raw(),
+    };
+    let id = raw_id & !EFF_FLAG;
     let (message_name, signals) = signal_lookup.get(&id).expect("Unknown message id");
     println!("\n{}", Purple.paint(message_name));
 
